@@ -20,24 +20,32 @@ on:
     branches: [ main ]
 
 permissions:
-  contents: read
+  contents: write
   packages: read
+
+concurrency:
+  group: package-dependencies-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   package:
-    name: Download and zip dependency pack
+    name: Download, split, and push dependency pack
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     env:
       PACK_DIR: dependency-pack
       OUT_ZIP: mitigationbench-target-dependencies.zip
+      PARTS_DIR: packed-dependencies
+      PART_SIZE: 95M
       INCLUDE_DOCKER_IMAGES: ${{ inputs.include_docker_images || 'false' }}
       INCLUDE_HUGGINGFACE_DATASET: ${{ inputs.include_huggingface_dataset || 'false' }}
 
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install host tools
         shell: bash
@@ -52,8 +60,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -rf "$PACK_DIR" "$OUT_ZIP"
+          rm -rf "$PACK_DIR" "$OUT_ZIP" "$PARTS_DIR"
           mkdir -p "$PACK_DIR"/{repos,papers,docker-images,datasets,metadata}
+          mkdir -p "$PARTS_DIR"
 
           cat > "$PACK_DIR/MANIFEST.generated.json" <<'JSON'
           {
@@ -138,17 +147,14 @@ jobs:
             fi
           }
 
-          # Public source repos
           clone_repo "exploitbench" "https://github.com/exploitbench/exploitbench.git" "main"
           clone_repo "vusec-typearmor" "https://github.com/vusec/typearmor.git" "master"
           clone_repo "vusec-patharmor" "https://github.com/vusec/patharmor.git" "master"
 
-          # Papers / design references
           download_file "quicksafe-sp26.pdf" "https://download.vusec.net/papers/quicksafe_sp26.pdf"
           download_file "codearmor-eurosp-2017.pdf" "https://download.vusec.net/papers/codearmor-eurosp-2017.pdf"
           download_file "exploitbench-arxiv-2605.14153.pdf" "https://arxiv.org/pdf/2605.14153"
 
-          # Hugging Face dataset pointer or optional full clone
           mkdir -p "$PACK_DIR/datasets/exploitbench-v8"
           cat > "$PACK_DIR/datasets/exploitbench-v8/README.fetch.txt" <<'EOF'
           Dataset pointer:
@@ -167,7 +173,6 @@ jobs:
             add_manifest_item "huggingface_dataset" "exploitbench-v8" "https://huggingface.co/datasets/exploitbench/v8" "datasets/exploitbench-v8/README.fetch.txt" "pointer_only"
           fi
 
-          # Optional Docker images. These can be very large.
           if [ "$INCLUDE_DOCKER_IMAGES" = "true" ]; then
             save_docker_image "ghcr.io/exploitbench/v8-r1:cve-2024-1939"
             save_docker_image "ghcr.io/exploitbench/v8-r1:cve-2024-6100"
@@ -193,18 +198,69 @@ jobs:
 
           zip -r "$OUT_ZIP" "$PACK_DIR"
 
-      - name: Upload dependency ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: mitigationbench-target-dependencies
-          path: mitigationbench-target-dependencies.zip
-          retention-days: 14
+      - name: Split ZIP into GitHub-safe parts
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Upload manifest and checksums
+          rm -rf "$PARTS_DIR"
+          mkdir -p "$PARTS_DIR"
+
+          split -b "$PART_SIZE" -d -a 4 "$OUT_ZIP" "$PARTS_DIR/${OUT_ZIP}.part-"
+
+          sha256sum "$OUT_ZIP" > "$PARTS_DIR/${OUT_ZIP}.sha256"
+          ls -lh "$PARTS_DIR" > "$PARTS_DIR/FILES.txt"
+
+          cat > "$PARTS_DIR/README.md" <<EOF
+          # MitigationBench target dependency pack
+
+          This folder contains split parts of:
+
+          \`\`\`text
+          $OUT_ZIP
+          \`\`\`
+
+          Recombine on Linux/macOS:
+
+          \`\`\`bash
+          cat ${OUT_ZIP}.part-* > ${OUT_ZIP}
+          sha256sum -c ${OUT_ZIP}.sha256
+          unzip ${OUT_ZIP}
+          \`\`\`
+
+          Recombine on Windows PowerShell:
+
+          \`\`\`powershell
+          cmd /c copy /b ${OUT_ZIP}.part-* ${OUT_ZIP}
+          \`\`\`
+
+          Parts are split at $PART_SIZE to stay below GitHub's 100 MiB per-file limit.
+          EOF
+
+          echo "Created split files:"
+          ls -lh "$PARTS_DIR"
+
+      - name: Commit and push split parts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$PARTS_DIR"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Add split mitigation benchmark dependency pack [skip ci]"
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Upload split parts as workflow artifact too
         uses: actions/upload-artifact@v4
         with:
-          name: mitigationbench-target-dependencies-manifest
-          path: |
-            dependency-pack/MANIFEST.generated.json
-            dependency-pack/SHA256SUMS
+          name: mitigationbench-target-dependencies-split
+          path: packed-dependencies/
           retention-days: 14
