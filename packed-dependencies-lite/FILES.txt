@@ -1,0 +1,5 @@
+total 34M
+-rw-r--r-- 1 runner runner   0 Jun 16 06:02 FILES.txt
+-rw-r--r-- 1 runner runner 34M Jun 16 06:02 mitigationbench-target-dependencies-lite.zip
+-rw-r--r-- 1 runner runner   9 Jun 16 06:02 mitigationbench-target-dependencies-lite.zip.bytes
+-rw-r--r-- 1 runner runner 136 Jun 16 06:02 mitigationbench-target-dependencies-lite.zip.sha256
