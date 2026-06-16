@@ -1,0 +1,210 @@
+name: Package mitigation benchmark dependencies
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_docker_images:
+        description: "Also pull and docker-save selected ExploitBench GHCR images. This can be very large."
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      include_huggingface_dataset:
+        description: "Download ExploitBench Hugging Face dataset metadata/artifacts when available."
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  package:
+    name: Download and zip dependency pack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      PACK_DIR: dependency-pack
+      OUT_ZIP: mitigationbench-target-dependencies.zip
+      INCLUDE_DOCKER_IMAGES: ${{ inputs.include_docker_images || 'false' }}
+      INCLUDE_HUGGINGFACE_DATASET: ${{ inputs.include_huggingface_dataset || 'false' }}
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Install host tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl git git-lfs jq unzip zip
+
+      - name: Download and package dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "$PACK_DIR" "$OUT_ZIP"
+          mkdir -p "$PACK_DIR"/{repos,papers,docker-images,datasets,metadata}
+
+          cat > "$PACK_DIR/MANIFEST.generated.json" <<'JSON'
+          {
+            "generated_by": "mitigationbench-targetpack-fetcher",
+            "items": []
+          }
+          JSON
+
+          add_manifest_item() {
+            local type="$1"
+            local name="$2"
+            local source="$3"
+            local path="$4"
+            local status="$5"
+
+            tmp="$(mktemp)"
+            jq \
+              --arg type "$type" \
+              --arg name "$name" \
+              --arg source "$source" \
+              --arg path "$path" \
+              --arg status "$status" \
+              '.items += [{type:$type,name:$name,source:$source,path:$path,status:$status}]' \
+              "$PACK_DIR/MANIFEST.generated.json" > "$tmp"
+            mv "$tmp" "$PACK_DIR/MANIFEST.generated.json"
+          }
+
+          clone_repo() {
+            local name="$1"
+            local url="$2"
+            local ref="$3"
+            local dest="$PACK_DIR/repos/$name"
+
+            echo "Cloning $name..."
+            if git clone --depth 1 --branch "$ref" "$url" "$dest"; then
+              (
+                cd "$dest"
+                git rev-parse HEAD > "../../metadata/${name}.commit"
+              )
+              add_manifest_item "repo" "$name" "$url#$ref" "repos/$name" "ok"
+            else
+              echo "Ref $ref failed for $name, retrying default branch..."
+              if git clone --depth 1 "$url" "$dest"; then
+                (
+                  cd "$dest"
+                  git rev-parse HEAD > "../../metadata/${name}.commit"
+                )
+                add_manifest_item "repo" "$name" "$url#default" "repos/$name" "ok_ref_fallback"
+              else
+                add_manifest_item "repo" "$name" "$url#$ref" "repos/$name" "failed"
+              fi
+            fi
+          }
+
+          download_file() {
+            local name="$1"
+            local url="$2"
+            local dest="$PACK_DIR/papers/$name"
+
+            echo "Downloading $name..."
+            if curl -fL --retry 3 --retry-delay 5 "$url" -o "$dest"; then
+              add_manifest_item "paper" "$name" "$url" "papers/$name" "ok"
+            else
+              add_manifest_item "paper" "$name" "$url" "papers/$name" "failed"
+            fi
+          }
+
+          save_docker_image() {
+            local image="$1"
+            local safe
+            safe="$(echo "$image" | tr '/:@' '___')"
+            local dest="$PACK_DIR/docker-images/${safe}.tar"
+
+            echo "Pulling Docker image $image..."
+            if docker pull "$image"; then
+              docker image inspect "$image" > "$PACK_DIR/metadata/${safe}.docker-inspect.json"
+              docker save "$image" -o "$dest"
+              gzip -9 "$dest"
+              add_manifest_item "docker_image" "$image" "$image" "docker-images/${safe}.tar.gz" "ok"
+            else
+              add_manifest_item "docker_image" "$image" "$image" "docker-images/${safe}.tar.gz" "failed"
+            fi
+          }
+
+          # Public source repos
+          clone_repo "exploitbench" "https://github.com/exploitbench/exploitbench.git" "main"
+          clone_repo "vusec-typearmor" "https://github.com/vusec/typearmor.git" "master"
+          clone_repo "vusec-patharmor" "https://github.com/vusec/patharmor.git" "master"
+
+          # Papers / design references
+          download_file "quicksafe-sp26.pdf" "https://download.vusec.net/papers/quicksafe_sp26.pdf"
+          download_file "codearmor-eurosp-2017.pdf" "https://download.vusec.net/papers/codearmor-eurosp-2017.pdf"
+          download_file "exploitbench-arxiv-2605.14153.pdf" "https://arxiv.org/pdf/2605.14153"
+
+          # Hugging Face dataset pointer or optional full clone
+          mkdir -p "$PACK_DIR/datasets/exploitbench-v8"
+          cat > "$PACK_DIR/datasets/exploitbench-v8/README.fetch.txt" <<'EOF'
+          Dataset pointer:
+          https://huggingface.co/datasets/exploitbench/v8
+
+          Full local clone:
+          git lfs install
+          git clone https://huggingface.co/datasets/exploitbench/v8 exploitbench-v8
+          EOF
+
+          if [ "$INCLUDE_HUGGINGFACE_DATASET" = "true" ]; then
+            git lfs install
+            git clone https://huggingface.co/datasets/exploitbench/v8 "$PACK_DIR/datasets/exploitbench-v8/full-clone" || true
+            add_manifest_item "huggingface_dataset" "exploitbench-v8" "https://huggingface.co/datasets/exploitbench/v8" "datasets/exploitbench-v8" "attempted"
+          else
+            add_manifest_item "huggingface_dataset" "exploitbench-v8" "https://huggingface.co/datasets/exploitbench/v8" "datasets/exploitbench-v8/README.fetch.txt" "pointer_only"
+          fi
+
+          # Optional Docker images. These can be very large.
+          if [ "$INCLUDE_DOCKER_IMAGES" = "true" ]; then
+            save_docker_image "ghcr.io/exploitbench/v8-r1:cve-2024-1939"
+            save_docker_image "ghcr.io/exploitbench/v8-r1:cve-2024-6100"
+            save_docker_image "ghcr.io/exploitbench/v8-r1:cve-2024-10231"
+            save_docker_image "ghcr.io/exploitbench/v8-r1:cve-2024-12053"
+          else
+            cat > "$PACK_DIR/docker-images/README.fetch.txt" <<'EOF'
+          Docker images were skipped by default.
+
+          Re-run the workflow manually with:
+          include_docker_images = true
+
+          Example manual pull:
+          docker pull ghcr.io/exploitbench/v8-r1:cve-2024-1939
+          EOF
+            add_manifest_item "docker_image_set" "exploitbench-v8-selected" "ghcr.io/exploitbench/v8-r1" "docker-images/README.fetch.txt" "skipped_by_default"
+          fi
+
+          (
+            cd "$PACK_DIR"
+            find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          )
+
+          zip -r "$OUT_ZIP" "$PACK_DIR"
+
+      - name: Upload dependency ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: mitigationbench-target-dependencies
+          path: mitigationbench-target-dependencies.zip
+          retention-days: 14
+
+      - name: Upload manifest and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: mitigationbench-target-dependencies-manifest
+          path: |
+            dependency-pack/MANIFEST.generated.json
+            dependency-pack/SHA256SUMS
+          retention-days: 14
