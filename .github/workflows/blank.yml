@@ -24,14 +24,38 @@ jobs:
     env:
       PACK_DIR: dependency-pack-lite
       OUT_DIR: packed-dependencies-lite
+      OLD_FULL_OUT_DIR: packed-dependencies
       OUT_ZIP: mitigationbench-target-dependencies-lite.zip
-      MAX_ZIP_BYTES: "99614720" # 95 MiB safety margin below GitHub 100 MiB hard limit
+      MAX_ZIP_BYTES: "99614720" # 95 MiB
 
     steps:
-      - name: Checkout this repo
+      - name: Sparse checkout repo without old large dependency parts
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          sparse-checkout: |
+            .github
+            README.md
+            packed-dependencies-lite
+          sparse-checkout-cone-mode: true
+
+      - name: Remove old full dependency pack from Git index
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Important:
+          # Because sparse checkout does not materialize packed-dependencies/,
+          # remove it from the index using git rm on the pathspec.
+          # Ignore failure if it is already absent.
+          git rm -r --ignore-unmatch "$OLD_FULL_OUT_DIR" || true
+
+          # Also clean old lite output from working tree/index.
+          git rm -r --ignore-unmatch "$OUT_DIR" || true
+          rm -rf "$PACK_DIR" "$OUT_DIR" "$OUT_ZIP"
 
       - name: Install host tools
         shell: bash
@@ -46,7 +70,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -rf "$PACK_DIR" "$OUT_DIR" "$OUT_ZIP"
           mkdir -p "$PACK_DIR"/{repos,papers,pointers,metadata}
           mkdir -p "$OUT_DIR"
 
@@ -108,6 +131,7 @@ jobs:
             shift 3
 
             local dest="$PACK_DIR/repos/$name"
+
             echo "Sparse cloning $name..."
 
             if git clone --depth 1 --filter=blob:none --sparse --branch "$branch" "$url" "$dest"; then
@@ -129,6 +153,7 @@ jobs:
             local max_bytes="$3"
 
             echo "Downloading paper candidate $name..."
+
             if curl -fL --retry 3 --retry-delay 5 --max-filesize "$max_bytes" "$url" -o "$dest"; then
               add_manifest_item "paper_pdf" "$name" "$url" "papers/$name" "ok" "PDF included because it is below size cap"
             else
@@ -140,7 +165,6 @@ jobs:
             fi
           }
 
-          # ExploitBench: keep source/config/docs/sample env; exclude future large runtime caches.
           sparse_clone \
             "exploitbench" \
             "https://github.com/exploitbench/exploitbench.git" \
@@ -156,7 +180,6 @@ jobs:
             "testenvs/sample-stack-bof" \
             "data"
 
-          # TypeArmor: include source and shipped server-bins because binfo parsing is valuable.
           sparse_clone \
             "vusec-typearmor" \
             "https://github.com/vusec/typearmor.git" \
@@ -171,8 +194,6 @@ jobs:
             "di-opt" \
             "server-bins"
 
-          # PathArmor: do NOT include huge bundled legacy toolchains.
-          # Keep toy-bug, scripts, docs, patches, and captured run logs.
           sparse_clone \
             "vusec-patharmor-lite" \
             "https://github.com/vusec/patharmor.git" \
@@ -190,19 +211,10 @@ jobs:
             "patches" \
             "typescript.*"
 
-          # Remove accidental heavyweight directories if sparse behavior changes.
           rm -rf \
             "$PACK_DIR/repos/vusec-patharmor-lite/Dyninst-8.2.1" \
             "$PACK_DIR/repos/vusec-patharmor-lite/DynamoRIO-Linux-5.0.0-9" \
             "$PACK_DIR/repos/vusec-patharmor-lite/nginx-0.8.54"
-
-          add_manifest_item \
-            "excluded_dependency" \
-            "ExploitBench V8 Docker images" \
-            "ghcr.io/exploitbench/v8-r1" \
-            "pointers/exploitbench-ghcr-images.txt" \
-            "pointer_only" \
-            "Docker images are too large for a sub-100MB GitHub repo pack; pull on first use"
 
           cat > "$PACK_DIR/pointers/exploitbench-ghcr-images.txt" <<'EOF'
           Do not vendor these in Git.
@@ -212,19 +224,15 @@ jobs:
 
           Example:
           docker pull ghcr.io/exploitbench/v8-r1:cve-2024-1939
-
-          ExploitBench configs:
-          repos/exploitbench/benchmarks/v8.yaml
-          repos/exploitbench/benchmarks/v8-small.yaml
           EOF
 
           add_manifest_item \
-            "excluded_dataset" \
-            "ExploitBench Hugging Face v8 dataset" \
-            "https://huggingface.co/datasets/exploitbench/v8" \
-            "pointers/exploitbench-v8-dataset.txt" \
+            "excluded_dependency" \
+            "ExploitBench V8 Docker images" \
+            "ghcr.io/exploitbench/v8-r1" \
+            "pointers/exploitbench-ghcr-images.txt" \
             "pointer_only" \
-            "Dataset is about 365MB, above the sub-100MB pack target"
+            "Docker images are too large for a sub-100MB GitHub repo pack; pull on first use"
 
           cat > "$PACK_DIR/pointers/exploitbench-v8-dataset.txt" <<'EOF'
           Do not vendor the full dataset in this repo.
@@ -238,12 +246,12 @@ jobs:
           EOF
 
           add_manifest_item \
-            "excluded_legacy_toolchains" \
-            "PathArmor bundled Dyninst/DynamoRIO/nginx" \
-            "https://github.com/vusec/patharmor" \
-            "pointers/patharmor-heavy-deps.txt" \
+            "excluded_dataset" \
+            "ExploitBench Hugging Face v8 dataset" \
+            "https://huggingface.co/datasets/exploitbench/v8" \
+            "pointers/exploitbench-v8-dataset.txt" \
             "pointer_only" \
-            "Bundled legacy deps are heavyweight; keep source pointers and toy-bug only"
+            "Dataset is above the sub-100MB pack target"
 
           cat > "$PACK_DIR/pointers/patharmor-heavy-deps.txt" <<'EOF'
           Excluded from lite pack:
@@ -256,8 +264,14 @@ jobs:
           from the under-100MB dependency pack.
           EOF
 
-          # Include paper PDFs only if individually small.
-          # If any is too large or unavailable, keep URL pointer instead.
+          add_manifest_item \
+            "excluded_legacy_toolchains" \
+            "PathArmor bundled Dyninst/DynamoRIO/nginx" \
+            "https://github.com/vusec/patharmor" \
+            "pointers/patharmor-heavy-deps.txt" \
+            "pointer_only" \
+            "Bundled legacy deps are heavyweight; keep source pointers and toy-bug only"
+
           download_pdf_if_small \
             "quicksafe-sp26.pdf" \
             "https://download.vusec.net/papers/quicksafe_sp26.pdf" \
@@ -273,7 +287,6 @@ jobs:
             "https://arxiv.org/pdf/2605.14153" \
             "25000000"
 
-          # Add a concise strategy doc inside the pack.
           cat > "$PACK_DIR/README.md" <<'EOF'
           # MitigationBench Lite Dependency Pack
 
@@ -291,15 +304,6 @@ jobs:
           - Full ExploitBench Hugging Face dataset.
           - PathArmor bundled legacy toolchains.
           - Large binary archives.
-
-          Use this pack for:
-          - code inspection
-          - readiness tests
-          - parser development
-          - config extraction
-          - lightweight CI verification
-
-          Pull heavyweight assets on demand from their upstream locations.
           EOF
 
           (
@@ -323,7 +327,6 @@ jobs:
           size="$(stat -c%s "$OUT_DIR/$OUT_ZIP")"
           echo "$size" > "$OUT_DIR/${OUT_ZIP}.bytes"
           sha256sum "$OUT_DIR/$OUT_ZIP" > "$OUT_DIR/${OUT_ZIP}.sha256"
-
           ls -lh "$OUT_DIR" > "$OUT_DIR/FILES.txt"
 
           if [ "$size" -gt "$MAX_ZIP_BYTES" ]; then
@@ -361,9 +364,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add -A "$OUT_DIR"
 
           if git diff --cached --quiet; then
@@ -371,7 +371,8 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Add under-100MB mitigation dependency lite pack [skip ci]"
+          git status --short
+          git commit -m "Replace full dependency pack with under-100MB lite pack [skip ci]"
           git push origin HEAD:${{ github.ref_name }}
 
       - name: Upload lite pack as workflow artifact
