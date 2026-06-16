@@ -1,4 +1,4 @@
-# MitigationBench Lite Dependency Pack
+# MitigationBench Lite Dependency Pack Plus Probes
 
 This directory contains a single under-100MB ZIP:
 
@@ -14,4 +14,5 @@ unzip mitigationbench-target-dependencies-lite.zip
 ```
 
 This pack intentionally excludes heavyweight Docker images, full datasets,
-and large legacy toolchains. See dependency-pack-lite/pointers/ after unzip.
+and large legacy toolchains. It includes pointer files, probe scripts,
+and backup plans for environments where Docker is unavailable.
