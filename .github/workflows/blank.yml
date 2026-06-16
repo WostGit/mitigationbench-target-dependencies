@@ -1,47 +1,31 @@
-name: Package mitigation benchmark dependencies
+name: Package lite mitigation benchmark dependencies
 
 on:
   workflow_dispatch:
-    inputs:
-      include_docker_images:
-        description: "Also pull and docker-save selected ExploitBench GHCR images. This can be very large."
-        required: true
-        default: "false"
-        type: choice
-        options: ["false", "true"]
-      include_huggingface_dataset:
-        description: "Download ExploitBench Hugging Face dataset metadata/artifacts when available."
-        required: true
-        default: "false"
-        type: choice
-        options: ["false", "true"]
 
   push:
     branches: [ main ]
     paths:
-      - ".github/workflows/package-dependencies.yml"
+      - ".github/workflows/package-lite-dependencies.yml"
 
 permissions:
   contents: write
-  packages: read
 
 concurrency:
-  group: package-dependencies-${{ github.ref }}
+  group: package-lite-dependencies-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  package:
-    name: Download, split, and push dependency pack
+  package-lite:
+    name: Build under-100MB dependency pack
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 90
 
     env:
-      PACK_DIR: dependency-pack
-      OUT_ZIP: mitigationbench-target-dependencies.zip
-      PARTS_DIR: packed-dependencies
-      PART_SIZE: 25M
-      INCLUDE_DOCKER_IMAGES: ${{ inputs.include_docker_images || 'false' }}
-      INCLUDE_HUGGINGFACE_DATASET: ${{ inputs.include_huggingface_dataset || 'false' }}
+      PACK_DIR: dependency-pack-lite
+      OUT_DIR: packed-dependencies-lite
+      OUT_ZIP: mitigationbench-target-dependencies-lite.zip
+      MAX_ZIP_BYTES: "99614720" # 95 MiB safety margin below GitHub 100 MiB hard limit
 
     steps:
       - name: Checkout this repo
@@ -55,20 +39,36 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ca-certificates curl git git-lfs jq unzip zip
+            ca-certificates curl git jq unzip zip rsync
 
-      - name: Download and package dependencies
+      - name: Build lite dependency pack
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf "$PACK_DIR" "$OUT_ZIP" "$PARTS_DIR"
-          mkdir -p "$PACK_DIR"/{repos,papers,docker-images,datasets,metadata}
-          mkdir -p "$PARTS_DIR"
+          rm -rf "$PACK_DIR" "$OUT_DIR" "$OUT_ZIP"
+          mkdir -p "$PACK_DIR"/{repos,papers,pointers,metadata}
+          mkdir -p "$OUT_DIR"
 
           cat > "$PACK_DIR/MANIFEST.generated.json" <<'JSON'
           {
-            "generated_by": "mitigationbench-targetpack-fetcher",
+            "pack_kind": "lite-under-100mb",
+            "policy": {
+              "include": [
+                "benchmark source",
+                "configs",
+                "docs",
+                "small test environments",
+                "paper PDFs when small enough",
+                "metadata and external pointers"
+              ],
+              "exclude": [
+                "Docker image archives",
+                "full Hugging Face datasets",
+                "large bundled legacy toolchains",
+                "large prebuilt binaries unless explicitly small"
+              ]
+            },
             "items": []
           }
           JSON
@@ -79,6 +79,7 @@ jobs:
             local source="$3"
             local path="$4"
             local status="$5"
+            local reason="$6"
 
             tmp="$(mktemp)"
             jq \
@@ -87,162 +88,275 @@ jobs:
               --arg source "$source" \
               --arg path "$path" \
               --arg status "$status" \
-              '.items += [{type:$type,name:$name,source:$source,path:$path,status:$status}]' \
+              --arg reason "$reason" \
+              '.items += [{
+                type:$type,
+                name:$name,
+                source:$source,
+                path:$path,
+                status:$status,
+                reason:$reason
+              }]' \
               "$PACK_DIR/MANIFEST.generated.json" > "$tmp"
             mv "$tmp" "$PACK_DIR/MANIFEST.generated.json"
           }
 
-          clone_repo() {
+          sparse_clone() {
             local name="$1"
             local url="$2"
-            local ref="$3"
-            local dest="$PACK_DIR/repos/$name"
+            local branch="$3"
+            shift 3
 
-            echo "Cloning $name..."
-            if git clone --depth 1 --branch "$ref" "$url" "$dest"; then
-              (
-                cd "$dest"
-                git rev-parse HEAD > "../../metadata/${name}.commit"
-              )
-              add_manifest_item "repo" "$name" "$url#$ref" "repos/$name" "ok"
+            local dest="$PACK_DIR/repos/$name"
+            echo "Sparse cloning $name..."
+
+            if git clone --depth 1 --filter=blob:none --sparse --branch "$branch" "$url" "$dest"; then
+              git -C "$dest" sparse-checkout set "$@"
             else
-              echo "Ref $ref failed for $name, retrying default branch..."
-              if git clone --depth 1 "$url" "$dest"; then
-                (
-                  cd "$dest"
-                  git rev-parse HEAD > "../../metadata/${name}.commit"
-                )
-                add_manifest_item "repo" "$name" "$url#default" "repos/$name" "ok_ref_fallback"
-              else
-                add_manifest_item "repo" "$name" "$url#$ref" "repos/$name" "failed"
-              fi
+              echo "Branch $branch failed for $name; retrying default branch..."
+              git clone --depth 1 --filter=blob:none --sparse "$url" "$dest"
+              git -C "$dest" sparse-checkout set "$@"
             fi
+
+            rm -rf "$dest/.git"
+            add_manifest_item "repo_sparse" "$name" "$url#$branch" "repos/$name" "ok" "Sparse source/config/docs only"
           }
 
-          download_file() {
+          download_pdf_if_small() {
             local name="$1"
             local url="$2"
             local dest="$PACK_DIR/papers/$name"
+            local max_bytes="$3"
 
-            echo "Downloading $name..."
-            if curl -fL --retry 3 --retry-delay 5 "$url" -o "$dest"; then
-              add_manifest_item "paper" "$name" "$url" "papers/$name" "ok"
+            echo "Downloading paper candidate $name..."
+            if curl -fL --retry 3 --retry-delay 5 --max-filesize "$max_bytes" "$url" -o "$dest"; then
+              add_manifest_item "paper_pdf" "$name" "$url" "papers/$name" "ok" "PDF included because it is below size cap"
             else
-              add_manifest_item "paper" "$name" "$url" "papers/$name" "failed"
+              rm -f "$dest"
+              cat > "$PACK_DIR/pointers/${name}.url.txt" <<EOF
+          $url
+          EOF
+              add_manifest_item "paper_pointer" "$name" "$url" "pointers/${name}.url.txt" "pointer_only" "PDF skipped because unavailable or above size cap"
             fi
           }
 
-          save_docker_image() {
-            local image="$1"
-            local safe
-            safe="$(echo "$image" | tr '/:@' '___')"
-            local dest="$PACK_DIR/docker-images/${safe}.tar"
+          # ExploitBench: keep source/config/docs/sample env; exclude future large runtime caches.
+          sparse_clone \
+            "exploitbench" \
+            "https://github.com/exploitbench/exploitbench.git" \
+            "main" \
+            "README.md" \
+            "LICENSE" \
+            "Makefile" \
+            "pyproject.toml" \
+            "benchmarks" \
+            "docs" \
+            "exploitbench" \
+            "scripts" \
+            "testenvs/sample-stack-bof" \
+            "data"
 
-            echo "Pulling Docker image $image..."
-            if docker pull "$image"; then
-              docker image inspect "$image" > "$PACK_DIR/metadata/${safe}.docker-inspect.json"
-              docker save "$image" -o "$dest"
-              gzip -9 "$dest"
-              add_manifest_item "docker_image" "$image" "$image" "docker-images/${safe}.tar.gz" "ok"
-            else
-              add_manifest_item "docker_image" "$image" "$image" "docker-images/${safe}.tar.gz" "failed"
-            fi
-          }
+          # TypeArmor: include source and shipped server-bins because binfo parsing is valuable.
+          sparse_clone \
+            "vusec-typearmor" \
+            "https://github.com/vusec/typearmor.git" \
+            "master" \
+            "README.md" \
+            "LICENSE-2.0.txt" \
+            "Makefile.inc" \
+            "envsetup.sh" \
+            "run-ta-static.sh" \
+            "include" \
+            "static" \
+            "di-opt" \
+            "server-bins"
 
-          clone_repo "exploitbench" "https://github.com/exploitbench/exploitbench.git" "main"
-          clone_repo "vusec-typearmor" "https://github.com/vusec/typearmor.git" "master"
-          clone_repo "vusec-patharmor" "https://github.com/vusec/patharmor.git" "master"
+          # PathArmor: do NOT include huge bundled legacy toolchains.
+          # Keep toy-bug, scripts, docs, patches, and captured run logs.
+          sparse_clone \
+            "vusec-patharmor-lite" \
+            "https://github.com/vusec/patharmor.git" \
+            "master" \
+            "README.md" \
+            "INSTALL.md" \
+            "LICENSE.md" \
+            "Makefile" \
+            "Makefile.inc" \
+            "toy-bug" \
+            "run-analyser.sh" \
+            "run-app.sh" \
+            "run-at.sh" \
+            "lkm-start.sh" \
+            "patches" \
+            "typescript.*"
 
-          download_file "quicksafe-sp26.pdf" "https://download.vusec.net/papers/quicksafe_sp26.pdf"
-          download_file "codearmor-eurosp-2017.pdf" "https://download.vusec.net/papers/codearmor-eurosp-2017.pdf"
-          download_file "exploitbench-arxiv-2605.14153.pdf" "https://arxiv.org/pdf/2605.14153"
+          # Remove accidental heavyweight directories if sparse behavior changes.
+          rm -rf \
+            "$PACK_DIR/repos/vusec-patharmor-lite/Dyninst-8.2.1" \
+            "$PACK_DIR/repos/vusec-patharmor-lite/DynamoRIO-Linux-5.0.0-9" \
+            "$PACK_DIR/repos/vusec-patharmor-lite/nginx-0.8.54"
 
-          mkdir -p "$PACK_DIR/datasets/exploitbench-v8"
-          cat > "$PACK_DIR/datasets/exploitbench-v8/README.fetch.txt" <<'EOF'
-          Dataset pointer:
+          add_manifest_item \
+            "excluded_dependency" \
+            "ExploitBench V8 Docker images" \
+            "ghcr.io/exploitbench/v8-r1" \
+            "pointers/exploitbench-ghcr-images.txt" \
+            "pointer_only" \
+            "Docker images are too large for a sub-100MB GitHub repo pack; pull on first use"
+
+          cat > "$PACK_DIR/pointers/exploitbench-ghcr-images.txt" <<'EOF'
+          Do not vendor these in Git.
+
+          ExploitBench V8 images are published at:
+          ghcr.io/exploitbench/v8-r1
+
+          Example:
+          docker pull ghcr.io/exploitbench/v8-r1:cve-2024-1939
+
+          ExploitBench configs:
+          repos/exploitbench/benchmarks/v8.yaml
+          repos/exploitbench/benchmarks/v8-small.yaml
+          EOF
+
+          add_manifest_item \
+            "excluded_dataset" \
+            "ExploitBench Hugging Face v8 dataset" \
+            "https://huggingface.co/datasets/exploitbench/v8" \
+            "pointers/exploitbench-v8-dataset.txt" \
+            "pointer_only" \
+            "Dataset is about 365MB, above the sub-100MB pack target"
+
+          cat > "$PACK_DIR/pointers/exploitbench-v8-dataset.txt" <<'EOF'
+          Do not vendor the full dataset in this repo.
+
+          Dataset:
           https://huggingface.co/datasets/exploitbench/v8
 
-          Full local clone:
+          Suggested local retrieval:
           git lfs install
           git clone https://huggingface.co/datasets/exploitbench/v8 exploitbench-v8
           EOF
 
-          if [ "$INCLUDE_HUGGINGFACE_DATASET" = "true" ]; then
-            git lfs install
-            git clone https://huggingface.co/datasets/exploitbench/v8 "$PACK_DIR/datasets/exploitbench-v8/full-clone" || true
-            add_manifest_item "huggingface_dataset" "exploitbench-v8" "https://huggingface.co/datasets/exploitbench/v8" "datasets/exploitbench-v8" "attempted"
-          else
-            add_manifest_item "huggingface_dataset" "exploitbench-v8" "https://huggingface.co/datasets/exploitbench/v8" "datasets/exploitbench-v8/README.fetch.txt" "pointer_only"
-          fi
+          add_manifest_item \
+            "excluded_legacy_toolchains" \
+            "PathArmor bundled Dyninst/DynamoRIO/nginx" \
+            "https://github.com/vusec/patharmor" \
+            "pointers/patharmor-heavy-deps.txt" \
+            "pointer_only" \
+            "Bundled legacy deps are heavyweight; keep source pointers and toy-bug only"
 
-          if [ "$INCLUDE_DOCKER_IMAGES" = "true" ]; then
-            save_docker_image "ghcr.io/exploitbench/v8-r1:cve-2024-1939"
-            save_docker_image "ghcr.io/exploitbench/v8-r1:cve-2024-6100"
-            save_docker_image "ghcr.io/exploitbench/v8-r1:cve-2024-10231"
-            save_docker_image "ghcr.io/exploitbench/v8-r1:cve-2024-12053"
-          else
-            cat > "$PACK_DIR/docker-images/README.fetch.txt" <<'EOF'
-          Docker images were skipped by default.
+          cat > "$PACK_DIR/pointers/patharmor-heavy-deps.txt" <<'EOF'
+          Excluded from lite pack:
 
-          Re-run the workflow manually with:
-          include_docker_images = true
+          - Dyninst-8.2.1
+          - DynamoRIO-Linux-5.0.0-9
+          - nginx-0.8.54
 
-          Example manual pull:
-          docker pull ghcr.io/exploitbench/v8-r1:cve-2024-1939
+          These exist in the upstream PathArmor repo but are intentionally omitted
+          from the under-100MB dependency pack.
           EOF
-            add_manifest_item "docker_image_set" "exploitbench-v8-selected" "ghcr.io/exploitbench/v8-r1" "docker-images/README.fetch.txt" "skipped_by_default"
-          fi
+
+          # Include paper PDFs only if individually small.
+          # If any is too large or unavailable, keep URL pointer instead.
+          download_pdf_if_small \
+            "quicksafe-sp26.pdf" \
+            "https://download.vusec.net/papers/quicksafe_sp26.pdf" \
+            "25000000"
+
+          download_pdf_if_small \
+            "codearmor-eurosp-2017.pdf" \
+            "https://download.vusec.net/papers/codearmor-eurosp-2017.pdf" \
+            "25000000"
+
+          download_pdf_if_small \
+            "exploitbench-arxiv-2605.14153.pdf" \
+            "https://arxiv.org/pdf/2605.14153" \
+            "25000000"
+
+          # Add a concise strategy doc inside the pack.
+          cat > "$PACK_DIR/README.md" <<'EOF'
+          # MitigationBench Lite Dependency Pack
+
+          This is the under-100MB dependency pack.
+
+          Included:
+          - ExploitBench source/config/docs/sample environment.
+          - TypeArmor source and server-bins where available.
+          - PathArmor lightweight source/docs/toy/log assets.
+          - Small paper PDFs when below the cap.
+          - Pointers for heavyweight assets.
+
+          Excluded:
+          - ExploitBench Docker images.
+          - Full ExploitBench Hugging Face dataset.
+          - PathArmor bundled legacy toolchains.
+          - Large binary archives.
+
+          Use this pack for:
+          - code inspection
+          - readiness tests
+          - parser development
+          - config extraction
+          - lightweight CI verification
+
+          Pull heavyweight assets on demand from their upstream locations.
+          EOF
 
           (
             cd "$PACK_DIR"
             find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
           )
 
-          zip -r "$OUT_ZIP" "$PACK_DIR"
+          echo "Lite pack inventory:"
+          du -ah "$PACK_DIR" | sort -h | tail -60
 
-      - name: Split ZIP into 25 MB parts
+      - name: Build ZIP and enforce under-100MB target
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf "$PARTS_DIR"
-          mkdir -p "$PARTS_DIR"
+          mkdir -p "$OUT_DIR"
+          rm -f "$OUT_DIR/$OUT_ZIP"
 
-          split -b "$PART_SIZE" -d -a 5 "$OUT_ZIP" "$PARTS_DIR/${OUT_ZIP}.part-"
+          zip -r "$OUT_DIR/$OUT_ZIP" "$PACK_DIR"
 
-          sha256sum "$OUT_ZIP" > "$PARTS_DIR/${OUT_ZIP}.sha256"
-          ls -lh "$PARTS_DIR" > "$PARTS_DIR/FILES.txt"
+          size="$(stat -c%s "$OUT_DIR/$OUT_ZIP")"
+          echo "$size" > "$OUT_DIR/${OUT_ZIP}.bytes"
+          sha256sum "$OUT_DIR/$OUT_ZIP" > "$OUT_DIR/${OUT_ZIP}.sha256"
 
-          cat > "$PARTS_DIR/README.md" <<EOF
-          # MitigationBench target dependency pack
+          ls -lh "$OUT_DIR" > "$OUT_DIR/FILES.txt"
 
-          This folder contains split parts of:
+          if [ "$size" -gt "$MAX_ZIP_BYTES" ]; then
+            echo "::error::Lite ZIP is too large: $size bytes > $MAX_ZIP_BYTES bytes"
+            echo "Largest files:"
+            find "$PACK_DIR" -type f -printf "%s %p\n" | sort -nr | head -50
+            exit 1
+          fi
+
+          cat > "$OUT_DIR/README.md" <<EOF
+          # MitigationBench Lite Dependency Pack
+
+          This directory contains a single under-100MB ZIP:
 
           \`\`\`text
           $OUT_ZIP
           \`\`\`
 
-          Recombine on Linux/macOS:
+          Verify:
 
           \`\`\`bash
-          cat ${OUT_ZIP}.part-* > ${OUT_ZIP}
           sha256sum -c ${OUT_ZIP}.sha256
           unzip ${OUT_ZIP}
           \`\`\`
 
-          Recombine on Windows PowerShell:
-
-          \`\`\`powershell
-          cmd /c copy /b ${OUT_ZIP}.part-* ${OUT_ZIP}
-          \`\`\`
-
-          Parts are split at $PART_SIZE to stay below connector and GitHub file-size limits.
+          This pack intentionally excludes heavyweight Docker images, full datasets,
+          and large legacy toolchains. See dependency-pack-lite/pointers/ after unzip.
           EOF
 
-          echo "Created split files:"
-          ls -lh "$PARTS_DIR"
+          echo "Final output:"
+          cat "$OUT_DIR/FILES.txt"
 
-      - name: Commit and push split parts
+      - name: Commit and push lite pack
         shell: bash
         run: |
           set -euo pipefail
@@ -250,19 +364,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -A "$PARTS_DIR"
+          git add -A "$OUT_DIR"
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "Add 25MB split mitigation benchmark dependency pack [skip ci]"
+          git commit -m "Add under-100MB mitigation dependency lite pack [skip ci]"
           git push origin HEAD:${{ github.ref_name }}
 
-      - name: Upload split parts as workflow artifact too
+      - name: Upload lite pack as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mitigationbench-target-dependencies-25mb-split
-          path: packed-dependencies/
+          name: mitigationbench-target-dependencies-lite
+          path: packed-dependencies-lite/
           retention-days: 14
