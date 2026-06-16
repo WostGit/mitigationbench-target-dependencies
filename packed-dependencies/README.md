@@ -20,4 +20,4 @@ Recombine on Windows PowerShell:
 cmd /c copy /b mitigationbench-target-dependencies.zip.part-* mitigationbench-target-dependencies.zip
 ```
 
-Parts are split at 95M to stay below GitHub's 100 MiB per-file limit.
+Parts are split at 25M to stay below connector and GitHub file-size limits.
