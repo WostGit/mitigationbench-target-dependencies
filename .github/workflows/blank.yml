@@ -18,6 +18,8 @@ on:
 
   push:
     branches: [ main ]
+    paths:
+      - ".github/workflows/package-dependencies.yml"
 
 permissions:
   contents: write
@@ -37,7 +39,7 @@ jobs:
       PACK_DIR: dependency-pack
       OUT_ZIP: mitigationbench-target-dependencies.zip
       PARTS_DIR: packed-dependencies
-      PART_SIZE: 95M
+      PART_SIZE: 25M
       INCLUDE_DOCKER_IMAGES: ${{ inputs.include_docker_images || 'false' }}
       INCLUDE_HUGGINGFACE_DATASET: ${{ inputs.include_huggingface_dataset || 'false' }}
 
@@ -198,7 +200,7 @@ jobs:
 
           zip -r "$OUT_ZIP" "$PACK_DIR"
 
-      - name: Split ZIP into GitHub-safe parts
+      - name: Split ZIP into 25 MB parts
         shell: bash
         run: |
           set -euo pipefail
@@ -206,7 +208,7 @@ jobs:
           rm -rf "$PARTS_DIR"
           mkdir -p "$PARTS_DIR"
 
-          split -b "$PART_SIZE" -d -a 4 "$OUT_ZIP" "$PARTS_DIR/${OUT_ZIP}.part-"
+          split -b "$PART_SIZE" -d -a 5 "$OUT_ZIP" "$PARTS_DIR/${OUT_ZIP}.part-"
 
           sha256sum "$OUT_ZIP" > "$PARTS_DIR/${OUT_ZIP}.sha256"
           ls -lh "$PARTS_DIR" > "$PARTS_DIR/FILES.txt"
@@ -234,7 +236,7 @@ jobs:
           cmd /c copy /b ${OUT_ZIP}.part-* ${OUT_ZIP}
           \`\`\`
 
-          Parts are split at $PART_SIZE to stay below GitHub's 100 MiB per-file limit.
+          Parts are split at $PART_SIZE to stay below connector and GitHub file-size limits.
           EOF
 
           echo "Created split files:"
@@ -248,19 +250,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add "$PARTS_DIR"
+          git add -A "$PARTS_DIR"
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "Add split mitigation benchmark dependency pack [skip ci]"
+          git commit -m "Add 25MB split mitigation benchmark dependency pack [skip ci]"
           git push origin HEAD:${{ github.ref_name }}
 
       - name: Upload split parts as workflow artifact too
         uses: actions/upload-artifact@v4
         with:
-          name: mitigationbench-target-dependencies-split
+          name: mitigationbench-target-dependencies-25mb-split
           path: packed-dependencies/
           retention-days: 14
