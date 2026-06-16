@@ -1,7 +1,20 @@
-name: Package lite mitigation benchmark dependencies
+name: Package lite mitigation benchmark dependencies plus probes
 
 on:
   workflow_dispatch:
+    inputs:
+      try_docker_probe:
+        description: "Try Docker/GHCR probe if Docker is available. Does not commit images."
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      try_typearmor_probe:
+        description: "Build TypeArmor dependency probe Dockerfile if Docker is available."
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
 
   push:
     branches: [ main ]
@@ -10,6 +23,7 @@ on:
 
 permissions:
   contents: write
+  packages: read
 
 concurrency:
   group: package-lite-dependencies-${{ github.ref }}
@@ -17,16 +31,19 @@ concurrency:
 
 jobs:
   package-lite:
-    name: Build under-100MB dependency pack
+    name: Build lite pack and dependency probes
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     env:
       PACK_DIR: dependency-pack-lite
       OUT_DIR: packed-dependencies-lite
       OLD_FULL_OUT_DIR: packed-dependencies
       OUT_ZIP: mitigationbench-target-dependencies-lite.zip
-      MAX_ZIP_BYTES: "99614720" # 95 MiB safety margin below GitHub 100 MiB hard limit
+      MAX_ZIP_BYTES: "99614720" # 95 MiB
+      TRY_DOCKER_PROBE: ${{ inputs.try_docker_probe || 'true' }}
+      TRY_TYPEARMOR_PROBE: ${{ inputs.try_typearmor_probe || 'true' }}
+      EXPLOITBENCH_ONE_IMAGE: ghcr.io/exploitbench/v8-r1:crbug-1509576
 
     steps:
       - name: Sparse checkout repo without old large dependency parts
@@ -47,11 +64,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Remove old huge full pack from the branch tip without checking out its blobs.
           git rm -r --ignore-unmatch "$OLD_FULL_OUT_DIR" || true
-
-          # Remove previous lite output so this run is deterministic.
           git rm -r --ignore-unmatch "$OUT_DIR" || true
+
           rm -rf "$PACK_DIR" "$OUT_DIR" "$OUT_ZIP"
 
       - name: Install host tools
@@ -60,19 +75,20 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ca-certificates curl git jq unzip zip rsync
+            ca-certificates curl git jq unzip zip rsync file \
+            python3 python3-venv python3-pip build-essential make pkg-config
 
-      - name: Build lite dependency pack
+      - name: Build lite dependency pack and probes
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p "$PACK_DIR"/{repos,papers,pointers,metadata}
+          mkdir -p "$PACK_DIR"/{repos,papers,pointers,metadata,probes,scripts,reports}
           mkdir -p "$OUT_DIR"
 
           cat > "$PACK_DIR/MANIFEST.generated.json" <<'JSON'
           {
-            "pack_kind": "lite-under-100mb",
+            "pack_kind": "lite-under-100mb-plus-probes",
             "policy": {
               "include": [
                 "benchmark source",
@@ -80,13 +96,16 @@ jobs:
                 "docs",
                 "small test environments",
                 "paper PDFs when small enough",
-                "metadata and external pointers"
+                "metadata",
+                "probe scripts",
+                "external pointers",
+                "Docker fallback instructions"
               ],
               "exclude": [
                 "Docker image archives",
                 "full Hugging Face datasets",
                 "large bundled legacy toolchains",
-                "large prebuilt binaries unless explicitly small"
+                "large prebuilt binary archives"
               ]
             },
             "items": []
@@ -140,10 +159,7 @@ jobs:
 
             (
               cd "$dest"
-
-              # Non-cone mode supports individual files like README.md, Makefile, pyproject.toml.
               git sparse-checkout init --no-cone
-
               : > .git/info/sparse-checkout
 
               for pattern in "$@"; do
@@ -153,6 +169,7 @@ jobs:
               git read-tree -mu HEAD
             )
 
+            git -C "$dest" rev-parse HEAD > "$PACK_DIR/metadata/${name}.commit"
             rm -rf "$dest/.git"
 
             add_manifest_item \
@@ -173,6 +190,8 @@ jobs:
             echo "Downloading paper candidate $name..."
 
             if curl -fL --retry 3 --retry-delay 5 --max-filesize "$max_bytes" "$url" -o "$dest"; then
+              file "$dest" > "$PACK_DIR/metadata/${name}.file.txt" || true
+
               add_manifest_item \
                 "paper_pdf" \
                 "$name" \
@@ -259,14 +278,41 @@ jobs:
             "$PACK_DIR/repos/vusec-patharmor-lite/DynamoRIO-Linux-5.0.0-9" \
             "$PACK_DIR/repos/vusec-patharmor-lite/nginx-0.8.54"
 
-          cat > "$PACK_DIR/pointers/exploitbench-ghcr-images.txt" <<'EOF'
+          download_pdf_if_small \
+            "quicksafe-sp26.pdf" \
+            "https://download.vusec.net/papers/quicksafe_sp26.pdf" \
+            "25000000"
+
+          download_pdf_if_small \
+            "codearmor-eurosp-2017.pdf" \
+            "https://download.vusec.net/papers/codearmor-eurosp-2017.pdf" \
+            "25000000"
+
+          download_pdf_if_small \
+            "exploitbench-arxiv-2605.14153.pdf" \
+            "https://arxiv.org/pdf/2605.14153" \
+            "25000000"
+
+          # ------------------------------------------------------------
+          # Backup-first dependency probes
+          # ------------------------------------------------------------
+
+          cat > "$PACK_DIR/pointers/exploitbench-ghcr-images.txt" <<EOF
           Do not vendor these in Git.
 
-          ExploitBench V8 images are published at:
-          ghcr.io/exploitbench/v8-r1
+          Primary probe image:
+          $EXPLOITBENCH_ONE_IMAGE
 
           Example:
-          docker pull ghcr.io/exploitbench/v8-r1:cve-2024-1939
+          docker pull $EXPLOITBENCH_ONE_IMAGE
+
+          ExploitBench V8 image namespace:
+          ghcr.io/exploitbench/v8-r1
+
+          If Docker is unavailable:
+          - keep this as pointer-only
+          - parse repos/exploitbench/benchmarks/v8*.yaml
+          - use ExploitBench Python/config tests only
           EOF
 
           add_manifest_item \
@@ -275,13 +321,18 @@ jobs:
             "ghcr.io/exploitbench/v8-r1" \
             "pointers/exploitbench-ghcr-images.txt" \
             "pointer_only" \
-            "Docker images are too large for a sub-100MB GitHub repo pack; pull on first use"
+            "Docker images are too large for Git; pull one image only as a runtime gate"
 
           cat > "$PACK_DIR/pointers/exploitbench-v8-dataset.txt" <<'EOF'
           Do not vendor the full dataset in this repo.
 
           Dataset:
           https://huggingface.co/datasets/exploitbench/v8
+
+          Backup plan:
+          - keep dataset pointer-only
+          - parse benchmark configs from repos/exploitbench/benchmarks/
+          - pull dataset locally only if evaluating published model-result rows
 
           Suggested local retrieval:
           git lfs install
@@ -303,8 +354,11 @@ jobs:
           - DynamoRIO-Linux-5.0.0-9
           - nginx-0.8.54
 
-          These exist in the upstream PathArmor repo but are intentionally omitted
-          from the under-100MB dependency pack.
+          Backup plan:
+          - first build toy-bug only
+          - patch toy.c with #include <signal.h> if modern GCC requires it
+          - use full legacy dependencies only in a separate container/full clone
+          - do not commit legacy toolchains to Git
           EOF
 
           add_manifest_item \
@@ -315,23 +369,216 @@ jobs:
             "pointer_only" \
             "Bundled legacy deps are heavyweight; keep source pointers and toy-bug only"
 
-          download_pdf_if_small \
-            "quicksafe-sp26.pdf" \
-            "https://download.vusec.net/papers/quicksafe_sp26.pdf" \
-            "25000000"
+          cat > "$PACK_DIR/probes/Dockerfile.typearmor-dyninst-probe" <<'EOF'
+          # TypeArmor build dependency probe.
+          # Use outside Git as a disposable container.
+          FROM ubuntu:22.04
 
-          download_pdf_if_small \
-            "codearmor-eurosp-2017.pdf" \
-            "https://download.vusec.net/papers/codearmor-eurosp-2017.pdf" \
-            "25000000"
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+              build-essential cmake git ca-certificates \
+              libboost-all-dev libelf-dev binutils-dev pkg-config \
+              python3 make file && \
+              rm -rf /var/lib/apt/lists/*
 
-          download_pdf_if_small \
-            "exploitbench-arxiv-2605.14153.pdf" \
-            "https://arxiv.org/pdf/2605.14153" \
-            "25000000"
+          # Modern distro Dyninst may not be ABI-compatible with old TypeArmor,
+          # but this quickly tests whether BPatch.h and basic libs are available.
+          RUN apt-get update && \
+              apt-get install -y --no-install-recommends libdyninst-dev || true
+
+          WORKDIR /work
+          EOF
+
+          add_manifest_item \
+            "probe" \
+            "TypeArmor Dyninst probe Dockerfile" \
+            "local-generated" \
+            "probes/Dockerfile.typearmor-dyninst-probe" \
+            "ok" \
+            "Probe container for BPatch.h/Dyninst build boundary"
+
+          cat > "$PACK_DIR/scripts/patharmor-toy-modern-gcc.patch.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          target="${1:-repos/vusec-patharmor-lite/toy-bug/toy.c}"
+
+          if [ ! -f "$target" ]; then
+            echo "Missing $target" >&2
+            exit 1
+          fi
+
+          if grep -q '#include <signal.h>' "$target"; then
+            echo "signal.h already present"
+            exit 0
+          fi
+
+          tmp="$(mktemp)"
+          awk '
+            { print }
+            $0 ~ /^#include[[:space:]]+<stdio.h>/ {
+              print "#include <signal.h>"
+            }
+          ' "$target" > "$tmp"
+          mv "$tmp" "$target"
+          echo "Patched $target with #include <signal.h>"
+          EOF
+          chmod +x "$PACK_DIR/scripts/patharmor-toy-modern-gcc.patch.sh"
+
+          add_manifest_item \
+            "patch_script" \
+            "PathArmor toy modern GCC signal.h patch" \
+            "local-generated" \
+            "scripts/patharmor-toy-modern-gcc.patch.sh" \
+            "ok" \
+            "Makes toy-bug compile on modern GCC without modifying upstream source in Git"
+
+          cat > "$PACK_DIR/scripts/next_dependency_fetch_plan.sh" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "This script is a gated fetch plan. It does not commit large assets to Git."
+
+          case "\${1:-}" in
+            exploitbench-one-image)
+              image="\${2:-$EXPLOITBENCH_ONE_IMAGE}"
+              if ! command -v docker >/dev/null 2>&1; then
+                echo "Docker unavailable. Backup: keep image pointer-only and run Python/config tests." >&2
+                exit 20
+              fi
+              docker pull "\$image"
+              safe="\$(echo "\$image" | tr '/:@' '____')"
+              docker image inspect "\$image" > "docker-inspect-\${safe}.json"
+              ;;
+
+            typearmor-probe)
+              if ! command -v docker >/dev/null 2>&1; then
+                echo "Docker unavailable. Backup: install Dyninst headers locally or use Codespaces/VM." >&2
+                exit 20
+              fi
+              docker build -f probes/Dockerfile.typearmor-dyninst-probe -t typearmor-dyninst-probe .
+              ;;
+
+            patharmor-toy)
+              bash scripts/patharmor-toy-modern-gcc.patch.sh
+              make -C repos/vusec-patharmor-lite/toy-bug
+              ;;
+
+            hf-metadata)
+              echo "Dataset pointer:"
+              echo "https://huggingface.co/datasets/exploitbench/v8"
+              echo "Do not full-clone unless evaluating published model-result rows."
+              ;;
+
+            *)
+              echo "Usage:"
+              echo "  \$0 exploitbench-one-image [image]"
+              echo "  \$0 typearmor-probe"
+              echo "  \$0 patharmor-toy"
+              echo "  \$0 hf-metadata"
+              exit 2
+              ;;
+          esac
+          EOF
+          chmod +x "$PACK_DIR/scripts/next_dependency_fetch_plan.sh"
+
+          add_manifest_item \
+            "fetch_plan" \
+            "Gated additional dependency fetch script" \
+            "local-generated" \
+            "scripts/next_dependency_fetch_plan.sh" \
+            "ok" \
+            "Downloads only one heavyweight dependency at a time, with Docker backup plans"
+
+          # ------------------------------------------------------------
+          # Metadata-only probes that do not require Docker
+          # ------------------------------------------------------------
+
+          echo "Extracting ExploitBench image/CVE metadata..."
+          grep -RhoE 'ghcr\.io/exploitbench/v8-r1:[A-Za-z0-9_.:-]+' \
+            "$PACK_DIR/repos/exploitbench/benchmarks" \
+            | sort -u > "$PACK_DIR/metadata/exploitbench-ghcr-tags.txt" || true
+
+          grep -RhoEi 'cve-[0-9]{4}-[0-9]+' \
+            "$PACK_DIR/repos/exploitbench/benchmarks" \
+            | sort -u > "$PACK_DIR/metadata/exploitbench-cves.txt" || true
+
+          file "$PACK_DIR/repos/vusec-typearmor/server-bins/"* \
+            > "$PACK_DIR/metadata/typearmor-server-bins.file.txt" 2>/dev/null || true
+
+          du -ah "$PACK_DIR/repos/vusec-typearmor" \
+            | sort -h \
+            | tail -80 > "$PACK_DIR/metadata/typearmor-largest-files.txt" || true
+
+          grep -RniE 'Dyninst|BPatch|boost|libelf|libiberty|cmake|Ubuntu|server-bins|binfo' \
+            "$PACK_DIR/repos/vusec-typearmor/README.md" \
+            "$PACK_DIR/repos/vusec-typearmor/envsetup.sh" \
+            "$PACK_DIR/repos/vusec-typearmor/run-ta-static.sh" \
+            "$PACK_DIR/repos/vusec-typearmor/static" \
+            "$PACK_DIR/repos/vusec-typearmor/di-opt" \
+            > "$PACK_DIR/metadata/typearmor-dependency-clues.txt" 2>/dev/null || true
+
+          grep -RniE 'error|failed|warning|Dyninst|DynamoRIO|LLVM|kernel|toy|LBR|nginx' \
+            "$PACK_DIR/repos/vusec-patharmor-lite"/typescript* \
+            > "$PACK_DIR/metadata/patharmor-typescript-diagnostics.txt" 2>/dev/null || true
+
+          add_manifest_item \
+            "metadata" \
+            "Additional dependency metadata probes" \
+            "local-generated" \
+            "metadata/" \
+            "ok" \
+            "Text-only metadata for planning compile/runtime gates"
+
+          # ------------------------------------------------------------
+          # Optional Docker probes. Never fail the workflow on Docker.
+          # ------------------------------------------------------------
+
+          mkdir -p "$PACK_DIR/reports/docker-probes"
+
+          if [ "$TRY_DOCKER_PROBE" = "true" ]; then
+            if command -v docker >/dev/null 2>&1; then
+              echo "Docker exists. Trying GHCR login/pull metadata probe..."
+              {
+                echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
+                docker pull "$EXPLOITBENCH_ONE_IMAGE"
+                docker image inspect "$EXPLOITBENCH_ONE_IMAGE"
+              } > "$PACK_DIR/reports/docker-probes/exploitbench-one-image.log" 2>&1 || true
+            else
+              echo "Docker unavailable on runner. Kept pointer-only." \
+                > "$PACK_DIR/reports/docker-probes/exploitbench-one-image.log"
+            fi
+          else
+            echo "Docker probe disabled by workflow input." \
+              > "$PACK_DIR/reports/docker-probes/exploitbench-one-image.log"
+          fi
+
+          if [ "$TRY_TYPEARMOR_PROBE" = "true" ]; then
+            if command -v docker >/dev/null 2>&1; then
+              {
+                docker build \
+                  -f "$PACK_DIR/probes/Dockerfile.typearmor-dyninst-probe" \
+                  -t typearmor-dyninst-probe \
+                  "$PACK_DIR"
+              } > "$PACK_DIR/reports/docker-probes/typearmor-dyninst-probe.log" 2>&1 || true
+            else
+              echo "Docker unavailable on runner. Use Dockerfile.typearmor-dyninst-probe in a local VM/Codespace." \
+                > "$PACK_DIR/reports/docker-probes/typearmor-dyninst-probe.log"
+            fi
+          else
+            echo "TypeArmor Docker probe disabled by workflow input." \
+              > "$PACK_DIR/reports/docker-probes/typearmor-dyninst-probe.log"
+          fi
+
+          add_manifest_item \
+            "probe_report" \
+            "Docker probe logs" \
+            "local-generated" \
+            "reports/docker-probes/" \
+            "ok" \
+            "Logs are small; failures are non-fatal and include backup instructions"
 
           cat > "$PACK_DIR/README.md" <<'EOF'
-          # MitigationBench Lite Dependency Pack
+          # MitigationBench Lite Dependency Pack Plus Probes
 
           This is the under-100MB dependency pack.
 
@@ -339,23 +586,36 @@ jobs:
           - ExploitBench source/config/docs/sample environment.
           - TypeArmor source and server-bins where available.
           - PathArmor lightweight source/docs/toy/log assets.
-          - Small paper PDFs when below the cap.
-          - Pointers for heavyweight assets.
+          - Small paper PDFs.
+          - Pointer files for heavyweight assets.
+          - Probe Dockerfile/scripts.
+          - Backup plans for no-Docker environments.
 
           Excluded:
-          - ExploitBench Docker images.
+          - Docker image archives.
           - Full ExploitBench Hugging Face dataset.
           - PathArmor bundled legacy toolchains.
           - Large binary archives.
+
+          Recommended next commands after unzip:
+
+          ```bash
+          bash dependency-pack-lite/scripts/next_dependency_fetch_plan.sh patharmor-toy
+          bash dependency-pack-lite/scripts/next_dependency_fetch_plan.sh exploitbench-one-image
+          bash dependency-pack-lite/scripts/next_dependency_fetch_plan.sh typearmor-probe
+          ```
+
+          If Docker is unavailable, use source/config tests only and keep Docker assets pointer-only.
           EOF
 
+          # IMPORTANT: exclude SHA256SUMS itself to avoid self-reference failure.
           (
             cd "$PACK_DIR"
-            find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
           )
 
           echo "Lite pack inventory:"
-          du -ah "$PACK_DIR" | sort -h | tail -80
+          du -ah "$PACK_DIR" | sort -h | tail -100
 
       - name: Build ZIP and enforce under-100MB target
         shell: bash
@@ -375,12 +635,12 @@ jobs:
           if [ "$size" -gt "$MAX_ZIP_BYTES" ]; then
             echo "::error::Lite ZIP is too large: $size bytes > $MAX_ZIP_BYTES bytes"
             echo "Largest files:"
-            find "$PACK_DIR" -type f -printf "%s %p\n" | sort -nr | head -80
+            find "$PACK_DIR" -type f -printf "%s %p\n" | sort -nr | head -100
             exit 1
           fi
 
           cat > "$OUT_DIR/README.md" <<EOF
-          # MitigationBench Lite Dependency Pack
+          # MitigationBench Lite Dependency Pack Plus Probes
 
           This directory contains a single under-100MB ZIP:
 
@@ -396,7 +656,8 @@ jobs:
           \`\`\`
 
           This pack intentionally excludes heavyweight Docker images, full datasets,
-          and large legacy toolchains. See dependency-pack-lite/pointers/ after unzip.
+          and large legacy toolchains. It includes pointer files, probe scripts,
+          and backup plans for environments where Docker is unavailable.
           EOF
 
           echo "Final output:"
@@ -415,12 +676,12 @@ jobs:
           fi
 
           git status --short
-          git commit -m "Replace full dependency pack with under-100MB lite pack [skip ci]"
+          git commit -m "Update lite dependency pack with gated probes [skip ci]"
           git push origin HEAD:${{ github.ref_name }}
 
       - name: Upload lite pack as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mitigationbench-target-dependencies-lite
+          name: mitigationbench-target-dependencies-lite-plus-probes
           path: packed-dependencies-lite/
           retention-days: 14
